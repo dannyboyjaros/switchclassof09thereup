@@ -1,0 +1,24 @@
+# Build output
+build/
+*.nro
+*.elf
+*.nacp
+*.map
+*.o
+*.d
+
+# Release packages
+dist/
+*.zip
+
+# Game data - not redistributable
+assets/
+saves/
+*.wav
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
