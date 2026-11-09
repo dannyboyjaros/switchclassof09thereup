@@ -25,7 +25,7 @@
 #define TEX_CACHE 64
 #define CHUNK_CACHE 32
 #define MAX_SLOTS 36
-#define MAX_ANIM 8
+#define MAX_ANIM 16
 #define MAX_SEEN 64
 #define MAX_TOAST 256
 

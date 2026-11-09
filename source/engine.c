@@ -1209,12 +1209,32 @@ static int copy_file(const char *src, const char *dst) {
     return 1;
 }
 
+static void invalidate_texture(Engine *e, const char *path) {
+    int i;
+    for (i = 0; i < e->tex_count; i++) {
+        if (e->tex_cache[i].tex && strcmp(e->tex_cache[i].path, path) == 0) {
+            if (e->tex_cache[i].refs <= 0) {
+                SDL_DestroyTexture(e->tex_cache[i].tex);
+                e->tex_cache[i].tex = NULL;
+            }
+            e->tex_cache[i].path[0] = 0;
+            e->tex_cache[i].w = 0;
+            e->tex_cache[i].h = 0;
+            e->tex_cache[i].refs = 0;
+            e->tex_cache[i].last_used = 0;
+        }
+    }
+}
+
 static void save_slot_thumbnail(Engine *e, int slot) {
     char source[SAVE_PATH_MAX];
     char dest[SAVE_PATH_MAX];
     pause_thumbnail_path(e, source, sizeof(source));
     thumbnail_path(e, slot, dest, sizeof(dest));
     copy_file(source, dest);
+    /* An overwritten slot keeps the same path, so drop its cached texture;
+     * otherwise the save menu keeps showing the previous screenshot. */
+    invalidate_texture(e, dest);
 }
 
 static int slot_thumbnail_exists(Engine *e, int slot) {
@@ -1645,13 +1665,11 @@ static int find_item(Engine *e, const char *tag, const char *layer) {
 }
 
 static void set_item(Engine *e, const char *rel, const char *tag, const char *layer, const char *kind, const char *arg,
-                     int x, int y, int w, int h, int alpha, int flip, JsonValue *frames) {
+                     int x, int y, int w, int h, int alpha, int flip, JsonValue *frames, const char *behind) {
     int index = find_item(e, tag, layer);
     int order = 0;
+    int behind_order = -1;
     int i;
-    int keep_position = 0;
-    int keep_x = 0;
-    int keep_y = 0;
     LayerItem *item;
 
     if (kind && strcmp(kind, "keep") == 0) {
@@ -1660,15 +1678,6 @@ static void set_item(Engine *e, const char *rel, const char *tag, const char *la
 
     if (index >= 0) {
         order = e->items[index].order;
-        /* A bare `show <tag>` keeps Ren'Py's current transform, but the
-         * exporter re-emits the default center.  Keep the gamer brother at
-         * his existing spot while Mom is in the scene so he does not slide on
-         * top of Nicole and Mom; the next scene stages him normally. */
-        if (strcmp(tag, "gamer_brother") == 0 && find_item(e, "mom", layer) >= 0) {
-            keep_position = 1;
-            keep_x = e->items[index].x;
-            keep_y = e->items[index].y;
-        }
     }
     if (index < 0) {
         for (i = 0; i < MAX_ITEMS; i++) {
@@ -1681,6 +1690,43 @@ static void set_item(Engine *e, const char *rel, const char *tag, const char *la
     if (index < 0) {
         index = 0;
     }
+    if (behind && behind[0]) {
+        char list[256];
+        const char *layer_name = (layer && layer[0]) ? layer : "master";
+        char *p;
+        copy_str(list, sizeof(list), behind);
+        p = list;
+        while (p && *p) {
+            char *comma = strchr(p, ',');
+            int target;
+            if (comma) {
+                *comma = 0;
+            }
+            target = find_item(e, p, layer_name);
+            if (target >= 0 && target != index) {
+                int target_order = e->items[target].order;
+                if (behind_order < 0 || target_order < behind_order) {
+                    behind_order = target_order;
+                }
+            }
+            p = comma ? comma + 1 : NULL;
+        }
+        if (behind_order >= 0) {
+            int k;
+            for (k = 0; k < MAX_ITEMS; k++) {
+                if (!e->items[k].used || k == index) {
+                    continue;
+                }
+                if (strcmp(e->items[k].layer, layer_name) != 0) {
+                    continue;
+                }
+                if (e->items[k].order >= behind_order) {
+                    e->items[k].order++;
+                }
+            }
+            order = behind_order;
+        }
+    }
     item = &e->items[index];
     memset(item, 0, sizeof(*item));
     item->used = 1;
@@ -1689,13 +1735,22 @@ static void set_item(Engine *e, const char *rel, const char *tag, const char *la
     copy_str(item->kind, sizeof(item->kind), kind ? kind : "none");
     copy_str(item->rel, sizeof(item->rel), rel ? rel : "");
     copy_str(item->arg, sizeof(item->arg), arg ? arg : "");
-    item->x = keep_position ? keep_x : x;
-    item->y = keep_position ? keep_y : y;
+    item->x = x;
+    item->y = y;
     item->w = w;
     item->h = h;
     item->alpha = alpha < 0 ? 0 : (alpha > 255 ? 255 : alpha);
     item->flip = flip;
     item->order = order ? order : ++e->next_order;
+    {
+        int k;
+        e->next_order = 0;
+        for (k = 0; k < MAX_ITEMS; k++) {
+            if (e->items[k].used && e->items[k].order > e->next_order) {
+                e->next_order = e->items[k].order;
+            }
+        }
+    }
     item->anim_count = 0;
     item->anim_paused = 0;
     if (kind && strcmp(kind, "anim") == 0) {
@@ -2115,7 +2170,7 @@ static void execute_op(Engine *e) {
         clear_layer(e, "master");
         if (scene_kind[0] && strcmp(scene_kind, "none") != 0) {
             set_item(e, op_str(op, 1), "_scene", "master", scene_kind, op_str(op, 3), op_int(op, 4), op_int(op, 5),
-                     op_int(op, 6), op_int(op, 7), (int)(op_num(op, 8) * 255.0 + 0.5), op_int(op, 9), op_item(op, 10));
+                     op_int(op, 6), op_int(op, 7), (int)(op_num(op, 8) * 255.0 + 0.5), op_int(op, 9), op_item(op, 10), NULL);
         }
         return;
     }
@@ -2142,7 +2197,7 @@ static void execute_op(Engine *e) {
         }
         set_item(e, op_str(op, 1), op_str(op, 2), op_str(op, 3), item_kind, item_arg, op_int(op, 6),
                  op_int(op, 7), op_int(op, 8), op_int(op, 9), (int)(op_num(op, 10) * 255.0 + 0.5), op_int(op, 11),
-                 op_item(op, 12));
+                 op_item(op, 12), op_str(op, 13));
         return;
     }
     if (strcmp(kind, "hide") == 0) {
@@ -5068,10 +5123,17 @@ int engine_frame(Engine *e) {
     }
 
     if (e->want_thumb && e->mode == MODE_PAUSE) {
+        int thumb_mode = e->mode;
         e->want_thumb = 0;
         SDL_SetRenderDrawColor(e->renderer, 0, 0, 0, 255);
         SDL_RenderClear(e->renderer);
+        /* Capture the whole screen the player paused on: the game scene, the
+         * Sidekick, its story options, dialogue and the quick menu.  draw_world
+         * only draws choices in MODE_GAME, so render that frame before putting
+         * the pause mode back. */
+        e->mode = MODE_GAME;
         draw_world(e);
+        e->mode = thumb_mode;
         capture_pause_thumbnail(e);
     }
 
