@@ -2885,6 +2885,8 @@ static void handle_stick(Engine *e, int axis, int value) {
 
 static void dump_state(Engine *e);
 static void finish_splash(Engine *e);
+static void handle_touch(Engine *e, int x, int y);
+static void handle_finger(Engine *e, const SDL_TouchFingerEvent *finger);
 
 static void poll_events(Engine *e) {
     SDL_Event event;
@@ -2895,7 +2897,7 @@ static void poll_events(Engine *e) {
         }
         if (e->splash_active) {
             if (event.type == SDL_KEYDOWN || event.type == SDL_CONTROLLERBUTTONDOWN ||
-                event.type == SDL_MOUSEBUTTONDOWN) {
+                event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_FINGERDOWN) {
                 /* Ending videos play to the end; the intro and logo may be skipped. */
                 if (e->splash_mode != 2 && SDL_GetTicks() >= e->splash_skip_at) {
                     finish_splash(e);
@@ -2918,6 +2920,8 @@ static void poll_events(Engine *e) {
             } else {
                 handle_action(e, key_action(event.key.keysym.sym));
             }
+        } else if (event.type == SDL_FINGERDOWN) {
+            handle_finger(e, &event.tfinger);
         } else if (event.type == SDL_CONTROLLERBUTTONDOWN) {
             handle_action(e, button_action(event.cbutton.button));
 #ifdef __SWITCH__
@@ -2978,6 +2982,13 @@ static void poll_events(Engine *e) {
                 }
             }
         }
+#ifndef __SWITCH__
+        /* Desktop builds have no touchscreen, so let the mouse drive the same
+         * tap targets.  Switch taps arrive as SDL_FINGERDOWN above. */
+        if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
+            handle_touch(e, event.button.x, event.button.y);
+        }
+#endif
     }
 }
 
@@ -3399,8 +3410,8 @@ static void draw_main_menu(Engine *e) {
     }
     draw_text(e, FONT_SMALL,
               e->main_index == 5
-                  ? "Cross: endings   D-pad: move   Triangle: endings"
-                  : "Cross: select   D-pad: move   Triangle: endings",
+                  ? "Cross: endings   D-pad: move   Triangle: endings   Touch: tap"
+                  : "Cross: select   D-pad: move   Triangle: endings   Touch: tap",
               0x9A9A9A, 0, 30, SCREEN_H - 40, 0, 0);
 }
 
@@ -3429,7 +3440,7 @@ static void draw_pause(Engine *e) {
     fill_rect(e, 0, 0, SCREEN_W, SCREEN_H, 0x000000, 190);
     draw_text(e, FONT_TITLE, "PAUSED", 0xFFFFFF, 0, SCREEN_W / 2, 100, 1, 0);
     draw_rows(e, PAUSE_LABELS, 6, e->pause_index, SCREEN_W / 2, 270, 86, FONT_MENU, 0x888888, 0x66C1E0, 1);
-    draw_text(e, FONT_SMALL, "Cross: select   Circle: resume", 0x777777, 0, SCREEN_W / 2, SCREEN_H - 70, 1, 0);
+    draw_text(e, FONT_SMALL, "Cross: select   Circle: resume   Touch: tap", 0x777777, 0, SCREEN_W / 2, SCREEN_H - 70, 1, 0);
 }
 
 #define SLOT_CARD_W 414
@@ -3525,7 +3536,7 @@ static void draw_slots(Engine *e) {
                page_y + (page_button_h - arrow_size) / 2, arrow_size, arrow_size,
                (e->file_area == 1 && e->page_focus >= FILE_PAGES + 1) ? 255 : 140, 0);
 
-    draw_text(e, FONT_SLOT, is_save ? "Cross: save    Circle: back" : "Cross: load    Circle: back", 0x777777, 0,
+    draw_text(e, FONT_SLOT, is_save ? "Cross: save    Circle: back    Touch: tap twice" : "Cross: load    Circle: back    Touch: tap twice", 0x777777, 0,
               SCREEN_W / 2, SCREEN_H - 34, 1, 0);
 }
 
@@ -3539,7 +3550,7 @@ static void draw_options(Engine *e) {
     snprintf(label, sizeof(label), "Voice Volume      %d / 10", e->opt_voice);
     draw_text(e, FONT_MENU, label, e->options_index == 1 ? 0x66C1E0 : 0x888888, 0, SCREEN_W / 2, 420, 1, 0);
     draw_text(e, FONT_MENU, "Back", e->options_index == 2 ? 0x66C1E0 : 0x888888, 0, SCREEN_W / 2, 520, 1, 0);
-    draw_text(e, FONT_SMALL, "Left / Right changes the selected value", 0x777777, 0, SCREEN_W / 2, 700, 1, 0);
+    draw_text(e, FONT_SMALL, "Left / Right changes the selected value   Touch: tap left / right", 0x777777, 0, SCREEN_W / 2, 700, 1, 0);
 }
 
 static void draw_about(Engine *e) {
@@ -3557,7 +3568,8 @@ static void draw_about(Engine *e) {
              "Circle: step back one line\n"
              "Triangle: ending tracker (main menu)\n"
              "D-pad: navigate\n"
-             "Options / Start: in-game menu\n\n"
+             "Options / Start: in-game menu\n"
+             "Touch: tap menus, choices and slots\n\n"
              "Not affiliated with the developers, publishers, or Sony.",
              e->seen_count, total);
     draw_text(e, FONT_SMALL, body, 0xDDDDDD, 1300, 260, 190, 0, 8);
@@ -3667,6 +3679,230 @@ static void draw_endings(Engine *e) {
         draw_text(e, FONT_TRACKER, "No endings collected yet.", 0x000000, 0, 606, 392, 0, 0);
     }
     draw_text(e, FONT_TRACKER, "D-pad: choose/scroll   Cross: read   Circle: back", 0x2370BE, 0, 604, 758, 0, 0);
+}
+
+/* ------------------------------------------------------------------------- */
+/* touch input                                                               */
+/* ------------------------------------------------------------------------- */
+
+static int point_in(int x, int y, int rx, int ry, int rw, int rh) {
+    return x >= rx && x < rx + rw && y >= ry && y < ry + rh;
+}
+
+/* SDL reports finger positions normalized to the window, while the UI is laid
+ * out on the 1920x1080 logical screen.  Convert through the renderer so the
+ * hit areas still line up when the window is scaled (handheld vs docked). */
+static void handle_finger(Engine *e, const SDL_TouchFingerEvent *finger) {
+    int ww = SCREEN_W;
+    int wh = SCREEN_H;
+    float lx;
+    float ly;
+    if (!e->renderer) {
+        return;
+    }
+    SDL_GetWindowSize(e->window, &ww, &wh);
+    if (ww <= 0 || wh <= 0) {
+        ww = SCREEN_W;
+        wh = SCREEN_H;
+    }
+    SDL_RenderWindowToLogical(e->renderer, (int)(finger->x * (float)ww + 0.5f),
+                              (int)(finger->y * (float)wh + 0.5f), &lx, &ly);
+    if (lx < 0.0f || ly < 0.0f || lx >= SCREEN_W || ly >= SCREEN_H) {
+        return;
+    }
+    handle_touch(e, (int)lx, (int)ly);
+}
+
+/* Translate a tap on the logical screen into the same actions the pad and
+ * keyboard use.  Coordinates mirror the layout in the draw_* functions. */
+static void handle_touch(Engine *e, int x, int y) {
+    if (e->splash_active) {
+        return; /* tapping the splash is handled by poll_events */
+    }
+    if (e->newmsg_active && e->mode == MODE_MENU) {
+        handle_action(e, ACT_CONFIRM);
+        return;
+    }
+
+    if (e->mode == MODE_MENU) {
+        static const int buttons[5][4] = {
+            {219, 372, 468, 112}, /* NEWGAME */
+            {219, 472, 431, 112}, /* CONTINUE */
+            {219, 572, 377, 112}, /* OPTIONS */
+            {216, 672, 302, 112}, /* ABOUT */
+            {61, 956, 415, 98}    /* EXIT */
+        };
+        int i;
+        if (point_in(x, y, 1536, 832, 300, 190)) { /* ending tracker */
+            e->main_index = 5;
+            on_confirm(e);
+            return;
+        }
+        for (i = 0; i < 5; i++) {
+            if (point_in(x, y, buttons[i][0], buttons[i][1], buttons[i][2], buttons[i][3])) {
+                if (e->main_index != i) {
+                    e->main_index = i;
+                    play_chunk(e, "sfx", "audio/MainMenuRollover.mp3", 0, 0);
+                }
+                on_confirm(e);
+                return;
+            }
+        }
+        return;
+    }
+
+    if (e->mode == MODE_PAUSE) {
+        int i;
+        for (i = 0; i < 6; i++) {
+            int row_y = 270 + i * 86;
+            if (point_in(x, y, SCREEN_W / 2 - 420, row_y - 24, 840, 84)) {
+                if (e->pause_index != i) {
+                    e->pause_index = i;
+                    play_chunk(e, "sfx", "audio/MainMenuRollover.mp3", 0, 0);
+                }
+                on_confirm(e);
+                return;
+            }
+        }
+        return;
+    }
+
+    if (e->mode == MODE_SAVE || e->mode == MODE_LOAD) {
+        int grid_x = (SCREEN_W - SLOT_GRID_W) / 2;
+        int grid_y = (SCREEN_H - SLOT_GRID_H) * 2 / 10;
+        int page_button_w = 50;
+        int page_button_h = 45;
+        int arrow_size = 32;
+        int page_total = arrow_size * 2 + FILE_PAGES * page_button_w;
+        int page_x = (SCREEN_W - page_total) / 2;
+        int page_y = (SCREEN_H - page_button_h) * 75 / 100;
+        int i;
+
+        for (i = 0; i < FILE_PAGE_SLOTS; i++) {
+            int col = i % FILE_COLS;
+            int row = i / FILE_COLS;
+            int cx = grid_x + col * (SLOT_CARD_W + SLOT_CARD_GAP);
+            int cy = grid_y + row * (SLOT_CARD_H + SLOT_CARD_GAP);
+            if (point_in(x, y, cx, cy, SLOT_CARD_W, SLOT_CARD_H)) {
+                if (e->file_area == 0 && e->load_index == i) {
+                    file_confirm(e); /* second tap on the selected slot confirms */
+                } else {
+                    e->file_area = 0;
+                    e->load_index = i;
+                    e->page_focus = 1 + e->file_page;
+                    play_chunk(e, "sfx", "audio/MainMenuRollover.mp3", 0, 0);
+                }
+                return;
+            }
+        }
+
+        if (point_in(x, y, page_x, page_y, arrow_size, page_button_h)) {
+            file_set_page(e, e->file_page - 1);
+            play_chunk(e, "sfx", "audio/MainMenuPress.mp3", 0, 0);
+            return;
+        }
+        if (point_in(x, y, page_x + arrow_size + FILE_PAGES * page_button_w, page_y, arrow_size, page_button_h)) {
+            file_set_page(e, e->file_page + 1);
+            play_chunk(e, "sfx", "audio/MainMenuPress.mp3", 0, 0);
+            return;
+        }
+        for (i = 0; i < FILE_PAGES; i++) {
+            int bx = page_x + arrow_size + i * page_button_w;
+            if (point_in(x, y, bx, page_y, page_button_w, page_button_h)) {
+                file_set_page(e, i);
+                e->file_area = 0;
+                e->load_index = 0;
+                play_chunk(e, "sfx", "audio/MainMenuPress.mp3", 0, 0);
+                return;
+            }
+        }
+        return;
+    }
+
+    if (e->mode == MODE_OPTIONS) {
+        if (point_in(x, y, SCREEN_W / 2 - 420, 290, 840, 90)) {
+            e->options_index = 0;
+            on_adjust(e, x < SCREEN_W / 2 ? -1 : 1);
+            return;
+        }
+        if (point_in(x, y, SCREEN_W / 2 - 420, 390, 840, 90)) {
+            e->options_index = 1;
+            on_adjust(e, x < SCREEN_W / 2 ? -1 : 1);
+            return;
+        }
+        if (point_in(x, y, SCREEN_W / 2 - 420, 490, 840, 90)) {
+            e->options_index = 2;
+            on_confirm(e);
+            return;
+        }
+        return;
+    }
+
+    if (e->mode == MODE_ABOUT) {
+        on_confirm(e);
+        return;
+    }
+
+    if (e->mode == MODE_ENDINGS) {
+        if (e->endings_detail) {
+            on_confirm(e);
+            return;
+        }
+        {
+            const int rows = 10;
+            int i;
+            for (i = 0; i < rows; i++) {
+                int index = e->endings_top + i;
+                int ry = 392 + i * 36;
+                if (index >= e->seen_count) {
+                    break;
+                }
+                if (point_in(x, y, 593, ry, 663, 36)) {
+                    e->endings_index = index;
+                    on_confirm(e);
+                    return;
+                }
+            }
+        }
+        return;
+    }
+
+    if (e->mode == MODE_GAME) {
+        if (e->laptop_active) {
+            on_confirm(e);
+            return;
+        }
+        if (e->ending_active) {
+            on_confirm(e);
+            return;
+        }
+        if (e->wait_kind == WAIT_MENU && e->choice_count > 0) {
+            int cy = e->gui_choice_y;
+            int i;
+            for (i = 0; i < e->choice_count; i++) {
+                int row_h = e->gui_choice_h;
+                if (point_in(x, y, e->gui_choice_x, cy, e->gui_choice_w, row_h)) {
+                    e->choice_index = i;
+                    on_confirm(e);
+                    return;
+                }
+                cy += row_h + e->gui_choice_spacing;
+            }
+            return;
+        }
+        /* the left pills roll back one line; the phone opens the pause menu;
+         * anywhere else advances the dialogue */
+        if (e->hud && !e->csbox && point_in(x, y, 146, 826, 130, 260)) {
+            handle_action(e, ACT_BACK);
+            return;
+        }
+        if (e->hud && !e->csbox && point_in(x, y, 1500, 870, 380, 200)) {
+            handle_action(e, ACT_PAUSE);
+            return;
+        }
+        on_confirm(e);
+        return;
+    }
 }
 
 static void draw_toast(Engine *e) {
@@ -4024,6 +4260,11 @@ int engine_init(Engine *e, const char *script_path, const char *game_dir) {
         return 0;
     }
 
+#ifdef __SWITCH__
+    /* Touch input is handled from SDL_FINGERDOWN directly; stop SDL from also
+     * turning each tap into a synthetic mouse click, which would act twice. */
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+#endif
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0) {
         c09_trace("engine: SDL_Init failed: %s", SDL_GetError());
         printf("class09: SDL_Init failed: %s\n", SDL_GetError());

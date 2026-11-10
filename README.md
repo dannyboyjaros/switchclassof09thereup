@@ -22,7 +22,8 @@ No game assets are included in this repository.
 - Cutscene dialogue (`csbox`), laptop search screen, 7-entry ending tracker,
   A/B opening rotation, smoke overlay, saves/options/rollback.
 - Nintendo Switch controls: A confirm, B back/rollback, Y endings,
-  D-pad or left stick, + or - pause.
+  D-pad or left stick, + or - pause. Touchscreen taps drive the same menus,
+  choices and save slots.
 
 ## SD card layout
 
@@ -44,6 +45,7 @@ Saves, ending records and screenshots are written to
 | Y | ending tracker (main menu) |
 | D-pad / left stick | navigate |
 | + or - | pause menu |
+| Touchscreen | tap menus and choices; tap a save slot twice to save/load; tap the phone icon to pause, the left pills to roll back |
 | HOME | close the app |
 
 Opening videos can be skipped with A after a short delay.
